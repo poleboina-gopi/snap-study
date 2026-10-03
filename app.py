@@ -114,17 +114,20 @@ def send_chat_message(parts, active_key: str, model_name: str = "gemini-3.8-flas
 # Dispatch Engine: WhatsApp, Telegram & Email
 # ---------------------------------------------------------
 def clean_text_for_export(text: str, max_chars: int = 1500) -> str:
-    """Cleans up whitespace and safely limits length for chat delivery."""
+    """Cleans up excess whitespace while preserving line breaks and numbered lists for WhatsApp."""
     if not text:
-        return "No study summary notes available."
-    cleaned = " ".join(text.split())
+        return "No study explanation available."
+    import re
+    # Remove carriage returns and collapse 3+ consecutive line breaks into 2
+    cleaned = text.replace("\r", "")
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     if len(cleaned) > max_chars:
-        return cleaned[: max_chars - 3] + "..."
+        return cleaned[: max_chars - 30] + "\n\n...(see app for full notes)"
     return cleaned
 
 
-def send_whatsapp(to_number: str, user_name: str, summary: str):
-    """Dispatches study summary to WhatsApp via Twilio (Content API or direct)."""
+def send_whatsapp(to_number: str, user_name: str, text_payload: str):
+    """Dispatches study explanation or summary to WhatsApp via Twilio (Content API or direct)."""
     account_sid = get_secret("TWILIO_ACCOUNT_SID")
     auth_token = get_secret("TWILIO_AUTH_TOKEN")
     from_number = get_secret("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
@@ -137,25 +140,37 @@ def send_whatsapp(to_number: str, user_name: str, summary: str):
         from twilio.rest import Client as TwilioClient
 
         twilio_client = TwilioClient(account_sid, auth_token)
-        clean_summary = clean_text_for_export(summary, max_chars=1500)
+        clean_text = clean_text_for_export(text_payload, max_chars=1500)
         formatted_to = f"whatsapp:{to_number}" if not to_number.startswith("whatsapp:") else to_number
 
+        # If Content Template SID is provided, send via template (matches Twilio template builder)
         if content_sid:
-            content_vars = json.dumps({"1": user_name, "2": clean_summary}, ensure_ascii=False)
-            message = twilio_client.messages.create(
-                from_=from_number,
-                to=formatted_to,
-                content_sid=content_sid,
-                content_variables=content_vars,
-            )
+            try:
+                content_vars = json.dumps({"1": user_name, "2": clean_text}, ensure_ascii=False)
+                message = twilio_client.messages.create(
+                    from_=from_number,
+                    to=formatted_to,
+                    content_sid=content_sid,
+                    content_variables=content_vars,
+                )
+                return True, message.sid
+            except Exception as template_err:
+                # Seamless fallback to direct body if template encountered an issue
+                body_text = f"Hi {user_name}, here is your Snap & Study explanation:\n\n{clean_text}"
+                message = twilio_client.messages.create(
+                    from_=from_number,
+                    to=formatted_to,
+                    body=body_text,
+                )
+                return True, message.sid
         else:
-            body_text = f"🎓 Snap & Study Summary for {user_name}:\n\n{clean_summary}"
+            body_text = f"Hi {user_name}, here is your Snap & Study explanation:\n\n{clean_text}"
             message = twilio_client.messages.create(
                 from_=from_number,
                 to=formatted_to,
                 body=body_text,
             )
-        return True, message.sid
+            return True, message.sid
     except ImportError:
         return False, "Twilio library not installed. Run 'pip install twilio'."
     except Exception as error:
@@ -405,9 +420,37 @@ with header_col:
 with export_col:
     # Disable export until at least 1 Q&A exchange has occurred
     send_disabled = len(st.session_state.messages) <= 1
-    button_label = f"📤 Send to {st.session_state.channel}"
 
-    if st.button(button_label, disabled=send_disabled, use_container_width=True):
+    # Locate latest explanation
+    latest_explanation = None
+    welcome_msg = WELCOME_MESSAGE_TEMPLATE.format(
+        name=st.session_state.name, channel_name=st.session_state.channel
+    )
+    for msg in reversed(st.session_state.messages):
+        if msg.get("role") == "assistant" and msg.get("kind") == "text" and msg.get("content") != welcome_msg:
+            latest_explanation = msg.get("content")
+            break
+
+    button_label = f"📲 Text Explanation to {st.session_state.channel}"
+
+    if st.button(button_label, disabled=send_disabled or not latest_explanation, use_container_width=True):
+        with st.spinner(f"Texting explanation to {st.session_state.channel}..."):
+            success, info = dispatch_summary(
+                st.session_state.channel,
+                st.session_state.destination,
+                st.session_state.name,
+                latest_explanation,
+            )
+
+        if success:
+            st.success(f"Explanation sent to your {st.session_state.channel}! 📲")
+        else:
+            st.error(f"Dispatch notice: {info}")
+
+# Revision sheet options drawer
+with st.expander("📋 Export More: Full Study Session Summary & Downloads", expanded=False):
+    st.caption("Generate a synthesized cheat-sheet of every topic discussed today.")
+    if st.button(f"📤 Send Full Session Revision Sheet to {st.session_state.channel}", disabled=send_disabled, use_container_width=True):
         with st.spinner("Compiling high-yield revision sheet..."):
             summary_response = send_chat_message(SUMMARY_REQUEST_PROMPT, active_api_key, selected_model)
             st.session_state.last_summary = summary_response
@@ -420,16 +463,12 @@ with export_col:
                     st.session_state.name,
                     st.session_state.last_summary,
                 )
-
             if success:
-                st.success(f"Sent to {st.session_state.channel}! 📲 (ID: {info})")
+                st.success(f"Full summary sent to {st.session_state.channel}! 📲")
             else:
-                st.error(f"Dispatch notice: {info}")
-                st.info("💡 You can still view, copy, or download your notes below!")
+                st.error(f"Notice: {info}")
 
-# If a summary exists, offer a revision preview expander
-if st.session_state.get("last_summary"):
-    with st.expander("📋 View Latest Pocket Revision Sheet", expanded=False):
+    if st.session_state.get("last_summary"):
         st.markdown(st.session_state.last_summary)
         st.download_button(
             label="💾 Download Notes (.md)",
@@ -443,11 +482,33 @@ if st.session_state.get("last_summary"):
 # ---------------------------------------------------------
 # Step 3: Chat History Rendering
 # ---------------------------------------------------------
-def render_message(message):
-    """Renders a single chat bubble (text or image)."""
+def render_message(message, index: int = -1):
+    """Renders a single chat bubble (text or image) with direct WhatsApp export button for explanations."""
     with st.chat_message(message["role"]):
         if message["kind"] == "text":
             st.markdown(message["content"])
+
+            # If this is an actual explanation from Gemini (not the initial welcome message)
+            if message["role"] == "assistant" and index > 0:
+                channel = st.session_state.get("channel", "WhatsApp")
+                target = st.session_state.get("destination", "")
+                btn_key = f"send_exp_btn_{index}"
+                if st.button(
+                    f"📲 Text this Explanation to my {channel} ({target})",
+                    key=btn_key,
+                    help=f"Sends this specific explanation to {target}",
+                ):
+                    with st.spinner(f"Texting explanation to {channel}..."):
+                        success, info = dispatch_summary(
+                            channel,
+                            target,
+                            st.session_state.name,
+                            message["content"],
+                        )
+                    if success:
+                        st.success(f"Explanation texted to your {channel}! 📲")
+                    else:
+                        st.error(f"Couldn't send to {channel}: {info}")
         elif message["kind"] == "image":
             st.image(message["content"], caption="Uploaded Problem / Notes", use_container_width=True)
 
@@ -455,7 +516,7 @@ def render_message(message):
 def add_message(role: str, kind: str, content):
     """Appends to session history and immediately displays."""
     st.session_state.messages.append({"role": role, "kind": kind, "content": content})
-    render_message(st.session_state.messages[-1])
+    render_message(st.session_state.messages[-1], len(st.session_state.messages) - 1)
 
 
 # Initial welcome message
@@ -466,8 +527,8 @@ if not st.session_state.messages:
     )
     add_message("assistant", "text", welcome_text)
 else:
-    for msg in st.session_state.messages:
-        render_message(msg)
+    for idx, msg in enumerate(st.session_state.messages):
+        render_message(msg, idx)
 
 
 # ---------------------------------------------------------
