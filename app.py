@@ -1,6 +1,7 @@
 import html
 import json
 import os
+import time
 import streamlit as st
 from google import genai
 from google.genai import types
@@ -89,24 +90,49 @@ def get_gemini_client(api_key: str):
 
 
 def send_chat_message(parts, active_key: str, model_name: str = "gemini-3.8-flash"):
-    """Sends a message to the active Gemini chat session, with auto-healing fallback if model is 404."""
-    try:
-        return st.session_state.chat.send_message(parts).text
-    except Exception as error:
-        err_str = str(error)
-        if "404" in err_str or "NOT_FOUND" in err_str:
+    """Sends a message to the active Gemini chat session, with auto-healing and backoff retry for 503/404."""
+    candidate_models = [model_name, "gemini-3.8-flash", "gemini-3.5-flash", "gemini-flash-latest"]
+    # De-duplicate candidate models while preserving order
+    seen = set()
+    models_to_try = [m for m in candidate_models if not (m in seen or seen.add(m))]
+
+    last_error = None
+    for attempt_model in models_to_try:
+        # For each candidate model, try with brief exponential backoff if 503/429 is returned
+        for attempt in range(3):
             try:
-                fallback_model = "gemini-3.8-flash"
-                client = get_gemini_client(active_key)
-                st.session_state.chat = client.chats.create(
-                    model=fallback_model,
-                    config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-                )
-                st.session_state["active_model"] = fallback_model
+                # If chat object is not present or using a different model, re-instantiate
+                if "chat" not in st.session_state or st.session_state.get("active_model") != attempt_model:
+                    client = get_gemini_client(active_key)
+                    st.session_state.chat = client.chats.create(
+                        model=attempt_model,
+                        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+                    )
+                    st.session_state["active_model"] = attempt_model
+
                 return st.session_state.chat.send_message(parts).text
-            except Exception as retry_err:
-                return f"Sorry, something went wrong: {retry_err}"
-        return f"Sorry, something went wrong analyzing that: {error}"
+            except Exception as error:
+                last_error = error
+                err_str = str(error)
+
+                # 404 Not Found -> break inner loop to try next model immediately
+                if "404" in err_str or "NOT_FOUND" in err_str:
+                    break
+
+                # 503 High Demand / Unavailable -> brief wait and retry
+                if "503" in err_str or "UNAVAILABLE" in err_str:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+
+                # 429 Rate Limit -> brief wait and retry
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
+
+                # Unrecoverable error
+                break
+
+    return f"Google Gemini servers are temporarily busy (503). Retrying in a few seconds usually succeeds! Error: {last_error}"
 
 
 
