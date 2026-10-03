@@ -239,7 +239,7 @@ Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`:
 
 ```toml
 GEMINI_API_KEY = "your-gemini-api-key-here"
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.8-flash"
 
 # WhatsApp (Twilio)
 TWILIO_ACCOUNT_SID = "your-twilio-account-sid"

@@ -79,13 +79,35 @@ def get_secret(key: str, default: str = "") -> str:
 
 
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
-MODEL_NAME = get_secret("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL_NAME = get_secret("GEMINI_MODEL", "gemini-3.8-flash")
 
 
 @st.cache_resource
 def get_gemini_client(api_key: str):
     """Initializes and caches the official Google GenAI client."""
     return genai.Client(api_key=api_key)
+
+
+def send_chat_message(parts, active_key: str, model_name: str = "gemini-3.8-flash"):
+    """Sends a message to the active Gemini chat session, with auto-healing fallback if model is 404."""
+    try:
+        return st.session_state.chat.send_message(parts).text
+    except Exception as error:
+        err_str = str(error)
+        if "404" in err_str or "NOT_FOUND" in err_str:
+            try:
+                fallback_model = "gemini-3.8-flash"
+                client = get_gemini_client(active_key)
+                st.session_state.chat = client.chats.create(
+                    model=fallback_model,
+                    config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+                )
+                st.session_state["active_model"] = fallback_model
+                return st.session_state.chat.send_message(parts).text
+            except Exception as retry_err:
+                return f"Sorry, something went wrong: {retry_err}"
+        return f"Sorry, something went wrong analyzing that: {error}"
+
 
 
 # ---------------------------------------------------------
@@ -243,11 +265,29 @@ with st.sidebar:
     if "gemini_api_key_override" in st.session_state:
         active_api_key = st.session_state["gemini_api_key_override"]
 
+    model_options = ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-2.5-flash", "gemini-1.5-flash"]
+    default_idx = 0
+    if MODEL_NAME in model_options:
+        default_idx = model_options.index(MODEL_NAME)
+
     selected_model = st.selectbox(
         "Gemini Model",
-        options=["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash"],
-        index=0,
+        options=model_options,
+        index=default_idx,
     )
+
+    # Sync model changes dynamically to the active chat session
+    if "onboarded" in st.session_state and active_api_key and "chat" in st.session_state:
+        if st.session_state.get("active_model") != selected_model:
+            try:
+                client = get_gemini_client(active_api_key)
+                st.session_state.chat = client.chats.create(
+                    model=selected_model,
+                    config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+                )
+                st.session_state["active_model"] = selected_model
+            except Exception:
+                pass
 
     if "onboarded" in st.session_state:
         st.divider()
@@ -268,6 +308,7 @@ with st.sidebar:
                     model=selected_model,
                     config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
                 )
+                st.session_state["active_model"] = selected_model
             st.rerun()
 
 
@@ -339,6 +380,7 @@ if "onboarded" not in st.session_state:
                 model=selected_model,
                 config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
             )
+            st.session_state["active_model"] = selected_model
             st.session_state.messages = []
             st.session_state.onboarded = True
             st.session_state.last_summary = ""
@@ -367,11 +409,8 @@ with export_col:
 
     if st.button(button_label, disabled=send_disabled, use_container_width=True):
         with st.spinner("Compiling high-yield revision sheet..."):
-            try:
-                summary_response = st.session_state.chat.send_message(SUMMARY_REQUEST_PROMPT).text
-                st.session_state.last_summary = summary_response
-            except Exception as e:
-                summary_response = f"Failed to generate summary: {e}"
+            summary_response = send_chat_message(SUMMARY_REQUEST_PROMPT, active_api_key, selected_model)
+            st.session_state.last_summary = summary_response
 
         if st.session_state.last_summary:
             with st.spinner(f"Transmitting to {st.session_state.channel}..."):
@@ -441,10 +480,7 @@ if len(st.session_state.messages) > 1:
             if st.button(label, key=f"quick_{index}", use_container_width=True):
                 add_message("user", "text", prompt_text)
                 with st.spinner("Analyzing with Gemini..."):
-                    try:
-                        ans = st.session_state.chat.send_message(prompt_text).text
-                    except Exception as err:
-                        ans = f"Sorry, something went wrong: {err}"
+                    ans = send_chat_message(prompt_text, active_api_key, selected_model)
                 add_message("assistant", "text", ans)
                 st.rerun()
 
@@ -483,10 +519,7 @@ if user_input:
 
     # 3. Query Gemini multi-turn chat
     with st.spinner("Tutor is analyzing your problem & breaking down the concept..."):
-        try:
-            response = st.session_state.chat.send_message(parts).text
-        except Exception as error:
-            response = f"Sorry, something went wrong analyzing that: {error}"
+        response = send_chat_message(parts, active_api_key, selected_model)
 
     add_message("assistant", "text", response)
     st.rerun()
